@@ -1,0 +1,195 @@
+This is a code for document_qna_app. it has two subfolder, back end and front end. in backend we have a main.py whoch has the following content..
+import os
+import shutil
+import tempfile
+import uuid
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from pydantic import BaseModel
+from langchain_groq import ChatGroq
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_classic.chains.retrieval import create_retrieval_chain
+from langchain_pinecone import PineconeVectorStore  # FAISS এর বদলে Pinecone
+from langchain_community.document_loaders import PyPDFLoader  
+from langchain_google_genai import GoogleGenerativeAIEmbeddings 
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# API Keys validation
+if not os.getenv("GROQ_API_KEY") or not os.getenv("GOOGLE_API_KEY") or not os.getenv("PINECONE_API_KEY"):
+    raise ValueError("Missing API Keys (Groq, Google, or Pinecone) in Environment!")
+
+os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY")
+os.environ["PINECONE_API_KEY"] = os.getenv("PINECONE_API_KEY")
+index_name = os.getenv("PINECONE_INDEX_NAME", "document-qna-app")
+
+app = FastAPI(title="Document Q&A Pinecone Backend", version="2.0")
+
+# Initialize LLM and Embeddings globally
+llm = ChatGroq(groq_api_key=os.getenv("GROQ_API_KEY"), model_name="llama-3.1-8b-instant")
+embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+
+# Shared state for Summary (Vectors will live in Pinecone cloud)
+GLOBAL_STORE = {
+    "summary": None
+}
+
+QA_PROMPT = ChatPromptTemplate.from_template(
+"""
+Answer the questions based on the provided context only.
+Please provide the most accurate response based on the question
+<context>
+{context}
+<context>
+Questions:{input}
+"""
+)
+
+class QueryRequest(BaseModel):
+    question: str
+
+@app.post("/ingest")
+async def ingest_file(file: UploadFile = File(...)):
+    if not file.filename.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+        
+    unique_filename = f"tmp_{uuid.uuid4().hex}.pdf"
+    tmp_path = os.path.join(os.getcwd(), unique_filename)
+    
+    try:
+        with open(tmp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        loader = PyPDFLoader(tmp_path)
+        docs = loader.load()
+
+        if not docs:
+            raise HTTPException(status_code=400, detail="The PDF file is empty or unreadable.")
+
+        # Generate summary
+        combined_text = " ".join([doc.page_content for doc in docs[:5]])
+        summary_prompt = f"Provide a concise summary of the following text highlighting the main points:\n\n{combined_text}"
+        summary_response = llm.invoke(summary_prompt)
+        GLOBAL_STORE["summary"] = summary_response.content
+
+        # Chunk & Split Text
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        final_documents = text_splitter.split_documents(docs)
+
+        # Upsert documents directly into Pinecone Cloud Vector Store
+        PineconeVectorStore.from_documents(
+            final_documents, 
+            embeddings, 
+            index_name=index_name
+        )
+
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+        return {"message": "Vectors successfully uploaded to Pinecone", "summary": GLOBAL_STORE["summary"]}
+
+    except Exception as e:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/query")
+async def query_document(payload: QueryRequest):
+    try:
+        # Connect to existing Pinecone Index for searching
+        vector_store = PineconeVectorStore(index_name=index_name, embedding=embeddings)
+        
+        document_chain = create_stuff_documents_chain(llm, QA_PROMPT)
+        retriever = vector_store.as_retriever(search_kwargs={"k": 4})
+        retrieval_chain = create_retrieval_chain(retriever, document_chain)
+
+        response = retrieval_chain.invoke({'input': payload.question})
+
+        source_contexts = [
+            {"page": doc.metadata.get("page", 0) + 1, "content": doc.page_content} 
+            for doc in response.get("context", [])
+        ]
+
+        return {
+            "answer": response.get("answer"),
+            "context": source_contexts
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+in the frontend we have a app.py with the following content.
+
+import streamlit as st
+import requests
+
+# Set API Endpoint URL configurations
+BACKEND_URL = "http://127.0.0.1:8000"
+
+st.set_page_config(page_title="Enterprise Document Q&A", layout="wide")
+st.title("🛡️ Enterprise Document Q&A Architecture")
+st.caption("Decoupled Stack: Frontend (Streamlit) ⇄ Backend REST API (FastAPI)")
+
+# Initialize state wrappers
+if "summary" not in st.session_state:
+    st.session_state.summary = None
+if "ready" not in st.session_state:
+    st.session_state.ready = False
+
+# Sidebar layer for file handling actions
+with st.sidebar:
+    st.header("Document Storage Management")
+    uploaded_file = st.file_uploader("Upload target document", type=["pdf"])
+    
+    if uploaded_file is not None:
+        if st.button("Process & Build Vector Index", use_container_width=True):
+            with st.spinner("Processing on FastAPI cluster..."):
+                # Package binary payload array 
+                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+                try:
+                    response = requests.post(f"{BACKEND_URL}/ingest", files=files)
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        st.session_state.summary = data.get("summary")
+                        st.session_state.ready = True
+                        st.success("Indexing complete!")
+                    else:
+                        st.error(f"Backend processing failure: {response.json().get('detail')}")
+                except requests.exceptions.ConnectionError:
+                    st.error("Cannot connect to backend service. Is FastAPI server running?")
+
+# Primary UI rendering grid panel 
+if st.session_state.ready and st.session_state.summary:
+    with st.expander("📝 Document executive summary profile", expanded=True):
+        st.write(st.session_state.summary)
+
+    prompt = st.text_input("Query target index patterns:")
+
+    if prompt:
+        with st.spinner("Executing structural semantic search retrieval..."):
+            try:
+                res = requests.post(f"{BACKEND_URL}/query", json={"question": prompt})
+                if res.status_code == 200:
+                    answer_payload = res.json()
+                    st.subheader("System Answer Output:")
+                    st.info(answer_payload.get("answer"))
+                    
+                    st.subheader("Extracted Reference Context Proximity Nodes:")
+                    
+                    for idx, context_node in enumerate(answer_payload.get("context", [])):
+                        
+                        with st.checkbox(f"Context Node {idx + 1} (Document Page Ref: {context_node['page']})", value=False):
+                            st.write(context_node['content'])
+                else:
+                    st.error(f"Execution Error: {res.json().get('detail')}")
+            except Exception as e:
+                st.error(f"Request structural delivery broken connection context: {e}")
+else:
+    st.info("System awaiting document insertion index processing pipeline execution triggers inside sidebar context panels.")
+
+
+
+I want to understand each and everything about this code.. why we are doing?? how we are doing?? everything 
