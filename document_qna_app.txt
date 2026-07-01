@@ -192,4 +192,3 @@ else:
 
 
 
-I want to understand each and everything about this code.. why we are doing?? how we are doing?? everything 
